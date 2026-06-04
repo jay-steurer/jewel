@@ -85,6 +85,8 @@ class DeprecatedRelatedUserViewSet(DABOAuth2UserViewsetMixin, GatewayModelViewSe
     the related view still checks organization view permission
     """
 
+    deprecated_message = "This endpoint is deprecated and will be removed in a future release. Use /api/gateway/v1/role_user_assignments/ instead."
+
     model = User
     queryset = with_auth_prefetch(User.objects).all()
     serializer_class = UserSerializer
