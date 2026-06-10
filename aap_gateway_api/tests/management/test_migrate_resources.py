@@ -19,6 +19,15 @@ from aap_gateway_api.tests.service_test_app.launch import launch_service
 SEP_CHAR = "_"
 _UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
 
+
+@pytest.fixture(autouse=True)
+def reset_migration_flag():
+    """Ensure the MigrateServiceDataHasRan flag is False before each test."""
+    from aap_gateway_api.models.migrate_data import MigrateServiceDataHasRan
+
+    MigrateServiceDataHasRan.mark_migration_not_completed()
+
+
 # Friendly reminder to all who come after me, this test file uses test fixtures defined
 # in module: aap_gateway_api/tests/service_test_app/fixtures/migration_tests.py
 # It might not be obvious because the test fixtures are not imported, the name of the
@@ -603,6 +612,71 @@ def test_migration_error_handling_and_summary(admin_user, capsys, service_api_ro
 
 
 @pytest.mark.django_db(transaction=True)
+def test_migration_skips_when_already_synced(admin_user, capsys, service_api_route_controller, patched_resource_client, system_user):
+    """Test that migration short-circuits when all resources are already migrated."""
+
+    with (
+        patch('aap_gateway_api.utils.resources_client.GWResourceAPIClient') as mock_client_class,
+        patch('aap_gateway_api.management.commands.migrate_service_data.Command.load_types_and_permissions'),
+    ):
+
+        def mock_client_factory(service_api, *args, **kwargs):
+            mock_client = Mock()
+            mock_client.service = service_api
+            mock_client.user = admin_user
+            mock_client.get_service_metadata.return_value.json.return_value = {
+                "service_id": str(uuid.uuid4()),
+                "service_type": "controller",
+            }
+            mock_client.list_resources.return_value.json.return_value = {"count": 0, "results": []}
+            mock_client.list_user_assignments.return_value.json.return_value = {"count": 0, "results": [], "next": None}
+            mock_client.list_team_assignments.return_value.json.return_value = {"count": 0, "results": [], "next": None}
+            return mock_client
+
+        mock_client_class.side_effect = mock_client_factory
+
+        call_command("migrate_service_data", username=admin_user.username)
+
+        captured = capsys.readouterr()
+        assert "already synchronized" in captured.out
+        assert "skipping resource migration" in captured.out
+        # Resource migration is skipped but role assignments still run
+        assert "Migrating data for" not in captured.out
+        assert "role assignments" in captured.out
+
+
+@pytest.mark.django_db(transaction=True)
+def test_migration_proceeds_when_not_synced(admin_user, capsys, service_api_route_controller, patched_resource_client, system_user):
+    """Test that migration proceeds normally when unmigrated resources exist."""
+
+    with (
+        patch('aap_gateway_api.utils.resources_client.GWResourceAPIClient') as mock_client_class,
+        patch('aap_gateway_api.management.commands.migrate_service_data.Command.load_types_and_permissions'),
+    ):
+
+        def mock_client_factory(service_api, *args, **kwargs):
+            mock_client = Mock()
+            mock_client.service = service_api
+            mock_client.user = admin_user
+            mock_client.get_service_metadata.return_value.json.return_value = {
+                "service_id": str(uuid.uuid4()),
+                "service_type": "controller",
+            }
+            mock_client.list_resources.return_value.json.return_value = {"count": 1, "results": []}
+            mock_client.list_user_assignments.return_value.json.return_value = {"count": 0, "results": [], "next": None}
+            mock_client.list_team_assignments.return_value.json.return_value = {"count": 0, "results": [], "next": None}
+            return mock_client
+
+        mock_client_class.side_effect = mock_client_factory
+
+        call_command("migrate_service_data", username=admin_user.username)
+
+        captured = capsys.readouterr()
+        assert "already synchronized" not in captured.out
+        assert "Migrating data for" in captured.out
+
+
+@pytest.mark.django_db(transaction=True)
 def test_no_services_found_error(admin_user):
     """Test error when no DefaultServiceType services are found"""
     # In a clean test environment with no service fixtures, the command should fail
@@ -1037,8 +1111,8 @@ def test_delete_legacy_authenticators_integration_with_migration(admin_user, cap
             "service_type": "controller",
         }
         mock_client.list_resources.return_value.json.return_value = {"count": 0, "results": []}
-        mock_client.list_user_assignments.return_value.json.return_value = {"count": 0, "results": []}
-        mock_client.list_team_assignments.return_value.json.return_value = {"count": 0, "results": []}
+        mock_client.list_user_assignments.return_value.json.return_value = {"count": 0, "results": [], "next": None}
+        mock_client.list_team_assignments.return_value.json.return_value = {"count": 0, "results": [], "next": None}
         mock_client_class.return_value = mock_client
 
         # Run migration
@@ -1701,10 +1775,11 @@ def test_use_controller_password_flag_correction_for_existing_users(
             resource_type = filters.get('content_type__resource_type__name')
 
             if resource_type == 'shared.user':
-                # We return the mocked user resource on the first call; that is the
-                # correction processing query.
+                # Call 1: _is_service_already_synced (return unmigrated so migration proceeds)
+                # Call 2: correction processing query (return the user resource)
+                # Call 3+: migration loop (return empty)
                 call_counts['shared.user'] += 1
-                if call_counts['shared.user'] == 1:
+                if call_counts['shared.user'] <= 2:
                     return Mock(json=lambda: {"count": 1, "results": [mock_user_resource]})
                 else:
                     return Mock(json=lambda: {"count": 0, "results": []})
@@ -1801,14 +1876,11 @@ def test_use_controller_password_flag_integration_with_migration(admin_user, cap
 
             if resource_type == 'shared.user':
                 call_counts['shared.user'] += 1
-                # The processing now includes a recovery stage to handle
-                # 2.4 -> 2.5 upgrades after which a user did not login followed
-                # by an upgrade to 2.6 which would make it imposible for the user
-                # to login using the controller password.
-                # For the purposes of this test we do not want the mocking of
-                # list_resources to return the user on the first (correction stage)
-                # request.
-                if call_counts['shared.user'] == 2:
+                # Call 1: _is_service_already_synced (return unmigrated so migration proceeds)
+                # Call 2: correction stage (return empty — we don't want correction here)
+                # Call 3: migration loop (return the user resource to be migrated)
+                # Call 4+: migration loop continuation (return empty)
+                if call_counts['shared.user'] in (1, 3):
                     return Mock(json=lambda: {"count": 1, "results": [mock_user_resource]})
                 else:
                     return Mock(json=lambda: {"count": 0, "results": []})
