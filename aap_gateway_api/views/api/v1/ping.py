@@ -3,7 +3,7 @@ from datetime import datetime
 import requests
 from ansible_base.lib.constants import STATUS_DEGRADED, STATUS_GOOD
 from django.conf import settings
-from django.db import connection
+from django.db import close_old_connections, connections
 from rest_framework.response import Response
 
 from aap_gateway_api.models import HTTPPort
@@ -17,7 +17,8 @@ class PingView(AnsibleBaseView):
     serializer_class = PingSerializer
 
     def _check_db(self):
-        with connection.cursor() as cursor:
+        close_old_connections()
+        with connections["healthcheck"].cursor() as cursor:
             cursor.execute("SELECT 1")
 
     def get(self, request):
