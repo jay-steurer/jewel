@@ -1,5 +1,8 @@
+import logging
 import re
 import uuid
+from collections import OrderedDict
+from io import StringIO
 from unittest.mock import Mock, patch
 
 import pytest
@@ -3137,3 +3140,444 @@ def test_log_progress_no_duplicate_100(caplog):
 
     progress_msgs = [msg for msg in caplog.messages if "(100%)" in msg and "exact" in msg]
     assert len(progress_msgs) == 1
+
+
+# =============================================================================
+# Tests for _configure_logging and _log (AAP-76816)
+# =============================================================================
+
+MIGRATE_LOGGER_NAME = "aap.gateway.management.commands.migrate_service_data"
+
+
+@pytest.fixture(autouse=True)
+def _restore_migrate_logger_state():
+    migrate_logger = logging.getLogger(MIGRATE_LOGGER_NAME)
+    original_handlers = migrate_logger.handlers[:]
+    original_level = migrate_logger.level
+    original_propagate = migrate_logger.propagate
+    try:
+        yield
+    finally:
+        for handler in migrate_logger.handlers[:]:
+            handler.close()
+        migrate_logger.handlers = original_handlers
+        migrate_logger.setLevel(original_level)
+        migrate_logger.propagate = original_propagate
+
+
+def test_configure_logging_with_log_file(tmp_path):
+    """When --log-file is provided, logger gets a StreamHandler at INFO."""
+    cmd = MigrateCommand()
+    log_file = tmp_path / "test.log"
+
+    cmd._configure_logging(str(log_file))
+
+    migrate_logger = logging.getLogger(MIGRATE_LOGGER_NAME)
+    assert len(migrate_logger.handlers) == 1
+    assert isinstance(migrate_logger.handlers[0], logging.StreamHandler)
+    assert migrate_logger.level <= logging.INFO
+    assert not migrate_logger.propagate
+
+    cmd._log_file_handle.close()
+
+
+def test_configure_logging_without_log_file():
+    """When --log-file is omitted, logger gets a NullHandler."""
+    cmd = MigrateCommand()
+
+    cmd._configure_logging(None)
+
+    migrate_logger = logging.getLogger(MIGRATE_LOGGER_NAME)
+    assert len(migrate_logger.handlers) == 1
+    assert isinstance(migrate_logger.handlers[0], logging.NullHandler)
+    assert not migrate_logger.propagate
+
+
+def test_configure_logging_closes_previous_file_handle(tmp_path):
+    """Calling _configure_logging twice closes the previous file handle."""
+    cmd = MigrateCommand()
+    first_log = tmp_path / "first.log"
+    second_log = tmp_path / "second.log"
+
+    cmd._configure_logging(str(first_log))
+    first_handle = cmd._log_file_handle
+    assert not first_handle.closed
+
+    cmd._configure_logging(str(second_log))
+    assert first_handle.closed
+    assert not cmd._log_file_handle.closed
+
+    cmd._log_file_handle.close()
+
+
+def test_configure_logging_respects_lower_level(tmp_path):
+    """If the logger is already at DEBUG, _configure_logging should not raise it to INFO."""
+    migrate_logger = logging.getLogger(MIGRATE_LOGGER_NAME)
+    migrate_logger.setLevel(logging.DEBUG)
+
+    cmd = MigrateCommand()
+    cmd._configure_logging(str(tmp_path / "test.log"))
+
+    assert migrate_logger.level == logging.DEBUG
+
+    cmd._log_file_handle.close()
+
+
+def test_configure_logging_inherits_formatter(tmp_path):
+    """When the aap logger has a console handler with a formatter, it should be reused."""
+    aap_logger = logging.getLogger("aap")
+    original_handlers = aap_logger.handlers[:]
+    test_formatter = logging.Formatter("TEST %(message)s")
+    test_handler = logging.StreamHandler()
+    test_handler.setFormatter(test_formatter)
+    aap_logger.handlers = [test_handler]
+
+    try:
+        cmd = MigrateCommand()
+        cmd._configure_logging(str(tmp_path / "test.log"))
+
+        migrate_logger = logging.getLogger(MIGRATE_LOGGER_NAME)
+        assert migrate_logger.handlers[0].formatter is test_formatter
+        cmd._log_file_handle.close()
+    finally:
+        aap_logger.handlers = original_handlers
+
+
+def test_log_info_writes_to_stdout(caplog):
+    """_log at INFO writes to stdout and the logger."""
+    cmd = MigrateCommand()
+    cmd.stdout = StringIO()
+
+    with caplog.at_level("INFO", logger=MIGRATE_LOGGER_NAME):
+        cmd._log("test info message", logging.INFO)
+
+    assert "test info message" in cmd.stdout.getvalue()
+    assert "test info message" in caplog.messages
+
+
+def test_log_warning_writes_to_stderr(caplog):
+    """_log at WARNING writes to stderr and the logger."""
+    cmd = MigrateCommand()
+    cmd.stderr = StringIO()
+
+    with caplog.at_level("WARNING", logger=MIGRATE_LOGGER_NAME):
+        cmd._log("test warning message", logging.WARNING)
+
+    assert "test warning message" in cmd.stderr.getvalue()
+    assert "test warning message" in caplog.messages
+
+
+def test_log_writes_to_log_file(tmp_path):
+    """_log writes structured output to --log-file."""
+    cmd = MigrateCommand()
+    log_file = tmp_path / "test.log"
+
+    cmd._configure_logging(str(log_file))
+    cmd._log("file output test", logging.INFO)
+    cmd._log_file_handle.flush()
+
+    content = log_file.read_text()
+    assert "file output test" in content
+    assert "INFO" in content
+
+    cmd._log_file_handle.close()
+
+
+def test_log_file_not_written_without_flag(tmp_path, caplog):
+    """Without --log-file, logger messages go to NullHandler only."""
+    cmd = MigrateCommand()
+    cmd.stdout = StringIO()
+    cmd._configure_logging(None)
+
+    with caplog.at_level("INFO", logger=MIGRATE_LOGGER_NAME):
+        cmd._log("null handler test", logging.INFO)
+
+    assert "null handler test" in cmd.stdout.getvalue()
+    assert "null handler test" not in caplog.messages
+
+
+def test_log_splits_newlines_for_logger(caplog):
+    """_log splits messages on newlines so each line gets a formatter prefix."""
+    cmd = MigrateCommand()
+    cmd.stdout = StringIO()
+
+    with caplog.at_level("INFO", logger=MIGRATE_LOGGER_NAME):
+        cmd._log("\n=== Section Header ===", logging.INFO)
+
+    assert "\n=== Section Header ===" in cmd.stdout.getvalue()
+    assert "=== Section Header ===" in caplog.messages
+    assert "" not in caplog.messages
+
+
+def test_log_splits_multiline_message(caplog):
+    """Multi-line messages produce one log record per non-empty line."""
+    cmd = MigrateCommand()
+    cmd.stderr = StringIO()
+
+    with caplog.at_level("WARNING", logger=MIGRATE_LOGGER_NAME):
+        cmd._log("line one\nline two\n\nline four", logging.WARNING)
+
+    assert "line one" in caplog.messages
+    assert "line two" in caplog.messages
+    assert "line four" in caplog.messages
+    assert len([m for m in caplog.messages if m in ("line one", "line two", "line four")]) == 3
+
+
+def test_copy_console_handler_config_no_aap_handlers(tmp_path):
+    """When the aap logger has no handlers, _copy_console_handler_config is a no-op."""
+    aap_logger = logging.getLogger("aap")
+    original_handlers = aap_logger.handlers[:]
+    aap_logger.handlers = []
+
+    try:
+        cmd = MigrateCommand()
+        cmd._configure_logging(str(tmp_path / "test.log"))
+
+        migrate_logger = logging.getLogger(MIGRATE_LOGGER_NAME)
+        assert migrate_logger.handlers[0].formatter is None
+        assert migrate_logger.handlers[0].filters == []
+        cmd._log_file_handle.close()
+    finally:
+        aap_logger.handlers = original_handlers
+
+
+@pytest.mark.django_db
+def test_reconcile_existing_resource_matching_ansible_id_same_data():
+    """Case 1 with matching data: logs 'Correcting service_id'."""
+    from ansible_base.resource_registry.models import ResourceType
+
+    cmd = MigrateCommand()
+    cmd.stdout = StringIO()
+    cmd.stderr = StringIO()
+
+    resource_type = ResourceType.objects.get(name="shared.organization")
+    org = Organization.objects.create(name="reconcile-org")
+    resource = Resource.objects.get(content_type=resource_type.content_type, object_id=org.pk)
+    local_data = resource_type.serializer_class(org).data
+
+    resource_context = {
+        "type": resource_type,
+        "unique_fields": ["name"],
+        "LocalResourceModel": Organization,
+    }
+    upstream_resource = {
+        "ansible_id": str(resource.ansible_id),
+        "name": org.name,
+        "resource_data": local_data,
+    }
+    updated_service_resource = {}
+
+    result = cmd._reconcile_existing_resource(upstream_resource, resource_context, local_data, updated_service_resource)
+
+    assert result is False
+    assert "Correcting service_id" in cmd.stdout.getvalue()
+
+
+@pytest.mark.django_db
+def test_reconcile_existing_resource_matching_ansible_id_different_data():
+    """Case 1 with different data: logs 'Updating already-merged' and overwrites resource_data."""
+    from ansible_base.resource_registry.models import ResourceType
+
+    cmd = MigrateCommand()
+    cmd.stdout = StringIO()
+    cmd.stderr = StringIO()
+
+    resource_type = ResourceType.objects.get(name="shared.organization")
+    org = Organization.objects.create(name="reconcile-org-diff")
+    resource = Resource.objects.get(content_type=resource_type.content_type, object_id=org.pk)
+    local_data = resource_type.serializer_class(org).data
+
+    resource_context = {
+        "type": resource_type,
+        "unique_fields": ["name"],
+        "LocalResourceModel": Organization,
+    }
+    upstream_resource = {
+        "ansible_id": str(resource.ansible_id),
+        "name": org.name,
+        "resource_data": {**local_data, "description": "stale upstream copy"},
+    }
+    updated_service_resource = {}
+
+    result = cmd._reconcile_existing_resource(upstream_resource, resource_context, local_data, updated_service_resource)
+
+    assert result is False
+    assert updated_service_resource["resource_data"] == local_data
+    combined_output = cmd.stdout.getvalue() + cmd.stderr.getvalue()
+    assert "Updating already-merged" in combined_output
+
+
+# =============================================================================
+# Tests for _migrate_single_service error paths (coverage)
+# =============================================================================
+
+
+@pytest.mark.django_db
+def test_migrate_single_service_skips_unknown_service_type(admin_user, capsys, service_api_route_controller):
+    """When service metadata reports an unknown service_type, the service is skipped with a warning."""
+    cmd = MigrateCommand()
+    cmd._progress_thresholds = {}
+    cmd.resource_types_to_migrate = OrderedDict()
+
+    mock_client = Mock()
+    mock_client.service = service_api_route_controller
+    mock_client.user = admin_user
+    mock_client.get_service_metadata.return_value.json.return_value = {
+        "service_id": str(uuid.uuid4()),
+        "service_type": "nonexistent_type",
+    }
+
+    with patch("aap_gateway_api.management.commands.migrate_service_data.resources_client.GWResourceAPIClient", return_value=mock_client):
+        success, error = cmd._migrate_single_service(service_api_route_controller, service_api_route_controller.api_slug, admin_user)
+
+    assert success is False
+    captured = capsys.readouterr()
+    assert "Skipping service" in captured.err
+    assert "Migrations are not allowed" in captured.err
+
+
+@pytest.mark.django_db
+def test_migrate_single_service_skips_mismatched_service_type(admin_user, capsys, service_api_route_controller):
+    """When the reported service_type doesn't match the configured one, the service is skipped."""
+    cmd = MigrateCommand()
+    cmd._progress_thresholds = {}
+    cmd.resource_types_to_migrate = OrderedDict()
+
+    mock_client = Mock()
+    mock_client.service = service_api_route_controller
+    mock_client.user = admin_user
+    mock_client.get_service_metadata.return_value.json.return_value = {
+        "service_id": str(uuid.uuid4()),
+        "service_type": "hub",
+    }
+
+    with patch("aap_gateway_api.management.commands.migrate_service_data.resources_client.GWResourceAPIClient", return_value=mock_client):
+        success, error = cmd._migrate_single_service(service_api_route_controller, service_api_route_controller.api_slug, admin_user)
+
+    assert success is False
+    captured = capsys.readouterr()
+    assert "Skipping service" in captured.err
+    assert "Service type mismatch" in captured.err
+
+
+# =============================================================================
+# Tests for _merge_partially_migrated_users and _merge_user_group (coverage)
+# =============================================================================
+
+
+@pytest.mark.django_db
+def test_merge_partially_migrated_users_with_users(admin_user, capsys, service_api_route_controller):
+    """Exercise the partially migrated user merge flow with actual users."""
+    cmd = MigrateCommand()
+    cmd._progress_thresholds = {}
+
+    controller_service_id = uuid.uuid4()
+    service_api_route_controller.service_cluster.service_id = controller_service_id
+    service_api_route_controller.service_cluster.save()
+
+    user1 = User.objects.create(username="controller_testmerge1")
+    resource1 = user1.resource
+    resource1.service_id = controller_service_id
+    resource1.is_partially_migrated = True
+    resource1.save()
+
+    cmd._merge_partially_migrated_users([service_api_route_controller], admin_user)
+
+    captured = capsys.readouterr()
+    assert "Grouping users by their service types" in captured.out
+    assert "Correlating users across services" in captured.out
+    assert "user groups to merge" in captured.out
+    assert "Merging" in captured.out
+    assert "Completed merging" in captured.out
+
+
+@pytest.mark.django_db
+def test_merge_user_group_with_conflicts(capsys):
+    """When users can't be merged due to conflicts, warnings are logged."""
+    cmd = MigrateCommand()
+    cmd._progress_thresholds = {}
+
+    user1 = User.objects.create(username="main_user", email="main@example.com")
+    user2 = User.objects.create(username="other_user", email="other@example.com")
+
+    user_accounts = [
+        ("controller", user1, "main_user"),
+        ("hub", user2, "other_user"),
+    ]
+
+    with patch("aap_gateway_api.management.commands.migrate_service_data.can_accounts_be_merged", return_value=False):
+        result = cmd._merge_user_group("main_user", user_accounts)
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Merging user group for" in captured.out
+    assert "Using controller user" in captured.out
+    assert "Cannot merge user group" in captured.err
+    assert "conflicts detected" in captured.err
+
+
+@pytest.mark.django_db
+def test_merge_user_group_successful(capsys):
+    """When users can be merged, the merge proceeds and logs progress."""
+    cmd = MigrateCommand()
+    cmd._progress_thresholds = {}
+
+    user1 = User.objects.create(username="main_user2")
+    user2 = User.objects.create(username="other_user2")
+
+    user_accounts = [
+        ("controller", user1, "main_user2"),
+        ("hub", user2, "other_user2"),
+    ]
+
+    with (
+        patch("aap_gateway_api.management.commands.migrate_service_data.can_accounts_be_merged", return_value=True),
+        patch("aap_gateway_api.management.commands.migrate_service_data.link_account"),
+        patch("aap_gateway_api.management.commands.migrate_service_data.migrate_account"),
+    ):
+        result = cmd._merge_user_group("main_user2", user_accounts)
+
+    assert result == 2
+    captured = capsys.readouterr()
+    assert "Merging hub user" in captured.out
+    assert "Successfully merged hub user" in captured.out
+    assert "Migrating main user" in captured.out
+    assert "Successfully migrated main user" in captured.out
+
+
+# =============================================================================
+# Tests for migrate_role_assignments resolve error path (coverage)
+# =============================================================================
+
+
+@pytest.mark.django_db
+def test_migrate_role_assignments_catches_resolve_error(capsys):
+    """Unexpected errors during role/actor/object resolution are caught and logged."""
+    cmd = MigrateCommand()
+    cmd._services_with_count_drift = set()
+    cmd._progress_thresholds = {}
+    mock_client = Mock()
+    cmd.client = mock_client
+
+    mock_response = Mock()
+    mock_response.json.return_value = {
+        "count": 1,
+        "results": [
+            {
+                "object_ansible_id": "does-not-exist",
+                "object_id": 999,
+                "content_type": "shared.organization",
+                "role_definition": "Some Role",
+                "user_ansible_id": str(uuid.uuid4()),
+            }
+        ],
+        "next": None,
+    }
+    mock_client.list_user_assignments.return_value = mock_response
+
+    with patch.object(cmd, "_resolve_role_definition", side_effect=RuntimeError("db connection lost")):
+        cmd.migrate_role_assignments(AssignmentActorType.USER, "controller", "controller")
+
+    captured = capsys.readouterr()
+    assert "Unable to process role user assignment, skipping" in captured.err
+    assert "db connection lost" in captured.err
