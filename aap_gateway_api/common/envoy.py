@@ -25,3 +25,5 @@ EXT_AUTHZ_FILTER = _type_url(ext_authz_pb2.ExtAuthz.DESCRIPTOR)
 HTTP_ROUTER = _type_url(router_pb2.Router.DESCRIPTOR)
 HTTP_CONNECTION_MANAGER = _type_url(http_connection_manager_pb2.HttpConnectionManager.DESCRIPTOR)
 STDOUT_ACCESS_LOG = _type_url(stream_pb2.StdoutAccessLog.DESCRIPTOR)
+
+AUTH_TYPE_NONE = "NONE"

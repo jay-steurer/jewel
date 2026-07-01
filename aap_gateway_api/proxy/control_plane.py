@@ -25,6 +25,7 @@ from rest_framework.request import Request as DRFRequest
 from rest_framework.settings import api_settings
 
 from aap_gateway_api.common.authentication import SERVICE_TOKEN_AUTH_STRING
+from aap_gateway_api.common.envoy import AUTH_TYPE_NONE
 from aap_gateway_api.models import ServiceCluster
 from aap_gateway_api.utils import JWTSessionCache, create_signed_jwt, get_jwt_rsa_key, get_preference_value
 
@@ -281,6 +282,13 @@ class _ExternalAuth:
 
         self.request_path = request.attributes.request.http.path
         self.is_internal_route = self.is_route_internal(request)
+
+        # Routes with auth_type=NONE (enable_gateway_auth=false) skip authentication
+        # but still get the X-Trusted-Proxy header to verify they came through the gateway.
+        # This is useful for services like EDA that handle their own authentication.
+        if self.auth_type == AUTH_TYPE_NONE:
+            logger.debug(f"Auth type is NONE for {self.request_id} {self.request_path} - adding trusted proxy header without authentication")
+            return self._return_no_authentication_required()
 
         # /static endpoints and any requests to the gateway api do not require any JWT authentication
         # This should never trigger if enable_gateway_auth is set to False on the gateway service.
