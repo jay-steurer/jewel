@@ -35,6 +35,57 @@ on:
     types:
       - completed
 jobs:
+  gate:
+    name: Check branch eligibility
+    runs-on: ubuntu-latest
+    # Both variables must be set for scanning to proceed. This also serves as
+    # fork protection: forks won't have these variables configured, so the
+    # workflow skips cleanly instead of running and failing on missing credentials.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      vars.SONAR_BRANCHES != '' &&
+      vars.SONAR_TOKEN_SECRET_NAME != ''
+    outputs:
+      branch: ${{ steps.check.outputs.branch }}
+      allowed: ${{ steps.check.outputs.allowed }}
+    steps:
+      - name: Check branch against SONAR_BRANCHES
+        id: check
+        env:
+          SONAR_BRANCHES: ${{ vars.SONAR_BRANCHES }}
+          EVENT_TYPE: ${{ github.event.workflow_run.event }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [ "$EVENT_TYPE" = "pull_request" ] || [ "$EVENT_TYPE" = "merge_group" ]; then
+            # workflow_run doesn't expose the PR base branch, so we can't check it here.
+            # Allow PRs and merge_group events through the gate; the PR analysis job
+            # resolves the base branch via the GitHub API and rechecks it against
+            # SONAR_BRANCHES before scanning. Merge group events run a branch analysis.
+            echo "branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ $EVENT_TYPE event — allowing through gate"
+            exit 0
+          fi
+
+          branch="$HEAD_BRANCH"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+          IFS=',' read -ra patterns <<< "$SONAR_BRANCHES"
+          for pattern in "${patterns[@]}"; do
+            pattern=$(echo "$pattern" | xargs)
+            # shellcheck disable=SC2254
+            case "$branch" in
+              $pattern)
+                echo "allowed=true" >> "$GITHUB_OUTPUT"
+                echo "✅ Branch '$branch' matches pattern '$pattern'"
+                exit 0
+                ;;
+            esac
+          done
+
+          echo "allowed=false" >> "$GITHUB_OUTPUT"
+          echo "⏭️ Branch '$branch' does not match any pattern in SONAR_BRANCHES: $SONAR_BRANCHES"
+
   sonar-pr-analysis:
     name: SonarCloud PR Analysis
     runs-on: ubuntu-latest
@@ -196,10 +247,8 @@ jobs:
       contents: read
       actions: read
     if: |
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      (github.repository == 'ansible-automation-platform/aap-gateway' || github.repository == 'ansible-automation-platform/aap-gateway-debug')
+      needs.gate.outputs.allowed == 'true' &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'merge_group')
     steps:
       - uses: actions/checkout@v4
         with:
@@ -218,6 +267,7 @@ jobs:
       - name: Print SonarCloud Analysis Summary
         env:
           BRANCH_NAME: ${{ github.event.workflow_run.head_branch }}
+          EVENT_TYPE: ${{ github.event.workflow_run.event }}
         run: |
           # Find all downloaded coverage XML files
           coverage_files=$(find . -name "coverage-*.xml" -type f | tr '\n' ',' | sed 's/,$//')
@@ -226,7 +276,7 @@ jobs:
 
           echo "🔍 SonarCloud Analysis Summary"
           echo "=============================="
-          echo "├── CI Event: ✅ Push (via workflow_run)"
+          echo "├── CI Event: ✅ $EVENT_TYPE (via workflow_run)"
           echo "├── Branch: $BRANCH_NAME"
           echo "├── Coverage Files: ${coverage_files:-none}"
           echo "├── Python Changes: ➖ N/A (Full codebase scan)"
