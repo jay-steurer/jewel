@@ -89,6 +89,11 @@ class Route(UniqueNamedCommonModel, AuditableModel):
         help_text=_("A comma-separated list of nodes in the service cluster to receive traffic from this route.  Leave blank to select all nodes."),
     )
 
+    @property
+    def is_gateway_service(self):
+        """True if this route targets the gateway service itself."""
+        return self.service_cluster.service_type.is_gateway_service
+
     def is_internal_route_string(self):
         return "t" if self.is_internal_route else "f"
 
@@ -233,19 +238,28 @@ class Route(UniqueNamedCommonModel, AuditableModel):
             }
 
         if not self.enable_gateway_auth:
-            # Instead of disabling the filter, pass NONE as auth_type
-            # This allows the control plane to add X-Trusted-Proxy header
-            # while skipping authentication (service handles its own auth)
-            cfg["typed_per_filter_config"][EXT_AUTH_FILTER] = {
-                TYPE_KEY: EXT_AUTH_PER_ROUTE,
-                "check_settings": {
-                    "context_extensions": {
-                        "is_internal_route": self.is_internal_route_string(),
-                        "service_type": self.service_cluster.service_type.name,
-                        "auth_type": AUTH_TYPE_NONE,
+            # Special case: Gateway service should completely disable ext_auth
+            # to avoid the X-Trusted-Proxy header causing permission issues when
+            # the gateway manages its own configuration through /api/gateway/
+            if self.is_gateway_service:
+                cfg["typed_per_filter_config"][EXT_AUTH_FILTER] = {
+                    TYPE_KEY: EXT_AUTH_PER_ROUTE,
+                    "disabled": True,
+                }
+            else:
+                # For other services (like EDA webhooks), pass NONE as auth_type
+                # This allows the control plane to add X-Trusted-Proxy header
+                # while skipping authentication (service handles its own auth)
+                cfg["typed_per_filter_config"][EXT_AUTH_FILTER] = {
+                    TYPE_KEY: EXT_AUTH_PER_ROUTE,
+                    "check_settings": {
+                        "context_extensions": {
+                            "is_internal_route": self.is_internal_route_string(),
+                            "service_type": self.service_cluster.service_type.name,
+                            "auth_type": AUTH_TYPE_NONE,
+                        },
                     },
-                },
-            }
+                }
         else:
             cfg["typed_per_filter_config"][EXT_AUTH_FILTER] = {
                 TYPE_KEY: EXT_AUTH_PER_ROUTE,
