@@ -90,9 +90,9 @@ class Route(UniqueNamedCommonModel, AuditableModel):
     )
 
     @property
-    def is_gateway_service(self):
-        """True if this route targets the gateway service itself."""
-        return self.service_cluster.service_type.is_gateway_service
+    def is_eda_service(self):
+        """True if this route targets the EDA service."""
+        return self.service_cluster.service_type.is_eda_service
 
     def is_internal_route_string(self):
         return "t" if self.is_internal_route else "f"
@@ -238,18 +238,9 @@ class Route(UniqueNamedCommonModel, AuditableModel):
             }
 
         if not self.enable_gateway_auth:
-            # Special case: Gateway service should completely disable ext_auth
-            # to avoid the X-Trusted-Proxy header causing permission issues when
-            # the gateway manages its own configuration through /api/gateway/
-            if self.is_gateway_service:
-                cfg["typed_per_filter_config"][EXT_AUTH_FILTER] = {
-                    TYPE_KEY: EXT_AUTH_PER_ROUTE,
-                    "disabled": True,
-                }
-            else:
-                # For other services (like EDA webhooks), pass NONE as auth_type
-                # This allows the control plane to add X-Trusted-Proxy header
-                # while skipping authentication (service handles its own auth)
+            if self.is_eda_service:
+                # EDA webhooks handle their own auth but need X-Trusted-Proxy
+                # to verify requests originated from the gateway (CVE fix)
                 cfg["typed_per_filter_config"][EXT_AUTH_FILTER] = {
                     TYPE_KEY: EXT_AUTH_PER_ROUTE,
                     "check_settings": {
@@ -259,6 +250,15 @@ class Route(UniqueNamedCommonModel, AuditableModel):
                             "auth_type": AUTH_TYPE_NONE,
                         },
                     },
+                }
+            else:
+                # All other services: completely disable ext_auth to restore
+                # pre-CVE-fix behavior. This avoids X-Trusted-Proxy being added
+                # (which causes 403 on gateway config writes) and prevents
+                # unnecessary gRPC calls (which causes 401 in proxy environments).
+                cfg["typed_per_filter_config"][EXT_AUTH_FILTER] = {
+                    TYPE_KEY: EXT_AUTH_PER_ROUTE,
+                    "disabled": True,
                 }
         else:
             cfg["typed_per_filter_config"][EXT_AUTH_FILTER] = {
